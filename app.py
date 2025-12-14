@@ -182,11 +182,12 @@ Question:
     else:
         answer = "NOT_FOUND"
 
-    # 3️⃣ Web fallback only if not document-based
-    if answer == "NOT_FOUND" and not is_doc_question:
-        log("🌐 Memory insufficient → searching web...")
+    # 3️⃣ Web fallback if answer is NOT_FOUND OR contains "Not available in uploaded documents"
+    if answer == "NOT_FOUND" or "Not available in uploaded documents" in answer:
+        log("🌐 Document insufficient → searching web...")
         web_text = web_search(question)
         if is_web_data_useless(web_text):
+            # fallback to general knowledge
             response = llm_client.chat.completions.create(
                 model="gemini-2.5-flash",
                 messages=[{"role": "user", "content": question}]
