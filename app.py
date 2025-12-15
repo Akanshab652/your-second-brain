@@ -5,7 +5,7 @@ import json
 import requests
 from typing import List
 from openai import OpenAI
-
+import re
 from rag_pipeline.vector_store import FaissVectorStore
 from rag_pipeline.ingest import ingest_paths
 
@@ -35,8 +35,16 @@ def load_history() -> List[dict]:
     return []
 
 def save_history(history: List[dict]):
+    safe_history = []
+    for h in history:
+        safe_history.append({
+            "user": redact_pii(h["user"]),
+            "bot": redact_pii(h["bot"])
+        })
+
     with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=2)
+        json.dump(safe_history, f, indent=2)
+
 
 def clear_history():
     if os.path.exists(HISTORY_FILE):
@@ -118,6 +126,8 @@ Question:
 # Memory Extraction
 # =====================================================
 def extract_memory(llm_client, question: str, answer: str) -> str | None:
+    question = redact_pii(question)
+    answer = redact_pii(answer)
     prompt = f"""
 Extract reusable factual knowledge.
 
@@ -138,34 +148,52 @@ Rules:
     return None if memory == "NONE" else memory
 
 def save_memory_to_store(memory_text: str, store: FaissVectorStore):
+    memory_text = redact_pii(memory_text)
+
+    # 🚫 Block storing if still contains redacted markers
+    if "[REDACTED_" in memory_text:
+        log("🚫 Memory blocked due to PII")
+        return
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
         f.write(memory_text.encode("utf-8"))
         path = f.name
+
     ingest_paths([path])
     store.load()
+
 
 # =====================================================
 # AGENT LOOP - FIXED
 # =====================================================
 def chat_with_brain(question, llm_client, store, history, top_k=3):
+
+    # 🚫 0️⃣ HARD BLOCK PII INTENT (FAIL FAST)
+    if PII_INTENT_PATTERN.search(question):
+        log("🚫 PII request blocked before LLM call")
+        return "I can’t help with personal contact or identity details."
+
     # 1️⃣ Vector search
+    question = redact_pii(question)
     results = store.query(question, top_k=top_k)
+
     context_chunks = []
     for r in results:
         text = r.get("page_content") or r.get("metadata", {}).get("text", "")
         if text and len(text.strip()) > 30:
             context_chunks.append(text)
+
     context = "\n\n".join(context_chunks)
     is_doc_question = len(context_chunks) > 0
 
-    # 2️⃣ Answer using documents if available
+    # 2️⃣ Answer using documents
     if is_doc_question:
         prompt = f"""
 Answer ONLY using the uploaded documents.
 
 Rules:
-- Do NOT use web knowledge
-- Do NOT switch to other entities
+- NEVER provide personal contact details
+- NEVER guess phone numbers or emails
 - If info is missing, say "Not available in uploaded documents"
 
 Context:
@@ -182,12 +210,12 @@ Question:
     else:
         answer = "NOT_FOUND"
 
-    # 3️⃣ Web fallback if answer is NOT_FOUND OR contains "Not available in uploaded documents"
+    # 3️⃣ Web fallback
     if answer == "NOT_FOUND" or "Not available in uploaded documents" in answer:
         log("🌐 Document insufficient → searching web...")
         web_text = web_search(question)
+
         if is_web_data_useless(web_text):
-            # fallback to general knowledge
             response = llm_client.chat.completions.create(
                 model="gemini-2.5-flash",
                 messages=[{"role": "user", "content": question}]
@@ -196,17 +224,72 @@ Question:
         else:
             answer = answer_from_web(llm_client, question, web_text)
 
-    # 4️⃣ Save UI history
-    history.append({"user": question, "bot": answer})
+    # 🚫 4️⃣ FAIL-FAST OUTPUT GUARDRAIL (MOST IMPORTANT)
+    if contains_contact_pii(answer):
+        log("🚫 Contact PII detected in model output")
+        return "I can’t share personal contact details."
+
+
+    # 5️⃣ Save safe history
+    history.append({
+        "user": question,
+        "bot": redact_pii(answer)
+    })
     save_history(history)
 
-    # 5️⃣ Learn only for non-document questions
+    # 6️⃣ Learn only if safe + non-document
     if not is_doc_question:
         memory = extract_memory(llm_client, question, answer)
         if memory:
             save_memory_to_store(memory, store)
 
     return answer
+
+# =====================================================
+# GUARDRAILS – PII DETECTION (FAIL-FAST)
+# =====================================================
+
+PII_INTENT_PATTERN = re.compile(
+    r"\b(phone number|mobile number|contact number|email id|address|aadhaar|pan)\b",
+    re.IGNORECASE
+)
+
+
+def contains_contact_pii(text: str) -> bool:
+    if not text:
+        return False
+
+    # Strong signals only
+    patterns = [
+        PII_PATTERNS["PHONE"],
+        PII_PATTERNS["EMAIL"],
+        PII_PATTERNS["AADHAAR"],
+        PII_PATTERNS["PAN"]
+    ]
+
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
+
+
+# =====================================================
+# GUARDRAILS – PII REDACTION
+# =====================================================
+
+PII_PATTERNS = {
+    "PHONE": r"(\+?\d{1,3}[- ]?)?\d{10}",
+    "EMAIL": r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+    "AADHAAR": r"\b\d{4}\s\d{4}\s\d{4}\b",
+    "PAN": r"\b[A-Z]{5}\d{4}[A-Z]\b",
+}
+
+def redact_pii(text: str) -> str:
+    if not text:
+        return text
+
+    redacted = text
+    for label, pattern in PII_PATTERNS.items():
+        redacted = re.sub(pattern, f"[REDACTED_{label}]", redacted, flags=re.IGNORECASE)
+
+    return redacted
 
 # =====================================================
 # STREAMLIT UI
