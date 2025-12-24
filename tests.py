@@ -1,6 +1,5 @@
 import unittest
-from add import add   # assuming file name is add.py
-
+from main import add   # assuming file name is add.py
 class TestAddFunction(unittest.TestCase):
 
     def test_positive_numbers(self):
